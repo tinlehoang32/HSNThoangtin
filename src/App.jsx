@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
 
 /*
   PHẦN MỀM HỒ SƠ NGHIỆM THU — NEWTECONS / Bộ phận MEP
@@ -25,6 +25,56 @@ function useScript(src, globalName) {
     document.body.appendChild(s);
   }, [src, globalName]);
   return ready;
+}
+
+// ============================================================
+//  LƯU TRỮ BỀN VỮNG (IndexedDB) — form mẫu + dữ liệu hồ sơ
+//  Reload trình duyệt vẫn còn. Dữ liệu nằm hoàn toàn trong máy.
+// ============================================================
+const DB_NAME = "hsnt_db";
+const DB_VER = 1;
+const STORE = "kv"; // key-value: templates, records, logo
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) return reject(new Error("Trình duyệt không hỗ trợ IndexedDB"));
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(val, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const r = tx.objectStore(STORE).get(key);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+// Chuyển template <-> dạng lưu được (ArrayBuffer không JSON hóa trực tiếp nên tách riêng)
+function tplToStore(tpl) {
+  // zipBuf là ArrayBuffer — IndexedDB lưu được trực tiếp, giữ nguyên
+  return {
+    id: tpl.id, name: tpl.name, fileName: tpl.fileName,
+    zipBuf: tpl.zipBuf, xml: tpl.xml, fields: tpl.fields,
+    hasKlLoop: tpl.hasKlLoop, hasKlTable: tpl.hasKlTable,
+    klRows: tpl.klRows, klColMap: tpl.klColMap,
+  };
 }
 
 // ============================================================
@@ -196,15 +246,43 @@ export default function App() {
   const docxReady = useScript("https://cdnjs.cloudflare.com/ajax/libs/docx/8.5.0/docx.umd.js", "docx");
   const xlsxReady = useScript("https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js", "XLSX");
 
-  // Danh sách "gói / template"
-  const [templates, setTemplates] = useState([]); // {id,name,zipB64,xml,fields,hasKlLoop}
+  // Danh sách "gói / template" + dữ liệu hồ sơ (đều được lưu bền vững)
+  const [templates, setTemplates] = useState([]);
   const [activeTpl, setActiveTpl] = useState(null);
+  const [records, setRecords] = useState({}); // { [tplId]: [hoSo,...] }
+  const [loaded, setLoaded] = useState(false); // đã nạp xong từ IndexedDB chưa
+
+  // Nạp dữ liệu đã lưu khi mở app
+  useEffect(() => {
+    (async () => {
+      try {
+        const [savedTpls, savedRecs, savedLogo] = await Promise.all([
+          idbGet("templates"), idbGet("records"), idbGet("logo"),
+        ]);
+        if (Array.isArray(savedTpls) && savedTpls.length) {
+          setTemplates(savedTpls);
+          setActiveTpl(savedTpls[0].id);
+        }
+        if (savedRecs && typeof savedRecs === "object") setRecords(savedRecs);
+        if (savedLogo) setLogo(savedLogo);
+      } catch (e) {
+        console.warn("Không nạp được dữ liệu đã lưu:", e);
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  // Tự lưu khi thay đổi (sau khi đã nạp xong, tránh ghi đè lúc khởi động)
+  useEffect(() => { if (loaded) idbSet("templates", templates.map(tplToStore)).catch(() => {}); }, [templates, loaded]);
+  useEffect(() => { if (loaded) idbSet("records", records).catch(() => {}); }, [records, loaded]);
+  useEffect(() => { if (loaded) idbSet("logo", logo).catch(() => {}); }, [logo, loaded]);
 
   return (
     <>
       <style>{globalCss}</style>
       {screen === "landing" ? (
-        <Landing logo={logo} setLogo={setLogo} onEnter={() => setScreen("app")} />
+        <Landing logo={logo} setLogo={setLogo} onEnter={() => setScreen("app")} savedCount={templates.length} />
       ) : (
         <AppShell
           logo={logo}
@@ -217,6 +295,8 @@ export default function App() {
           setTemplates={setTemplates}
           activeTpl={activeTpl}
           setActiveTpl={setActiveTpl}
+          records={records}
+          setRecords={setRecords}
         />
       )}
     </>
@@ -226,7 +306,7 @@ export default function App() {
 // ============================================================
 //  LANDING
 // ============================================================
-function Landing({ logo, setLogo, onEnter }) {
+function Landing({ logo, setLogo, onEnter, savedCount = 0 }) {
   const fileRef = useRef(null);
   const onPick = (e) => {
     const f = e.target.files?.[0];
@@ -249,6 +329,7 @@ function Landing({ logo, setLogo, onEnter }) {
         <input ref={fileRef} type="file" accept="image/*" onChange={onPick} style={{ display: "none" }} />
         <h1 style={L.h1}>Hồ sơ nghiệm thu</h1>
         <p style={L.sub}>Lập phiếu yêu cầu &amp; biên bản nghiệm thu cho mọi gói thầu — upload form mẫu riêng, app tự dò trường cần điền, xuất Word giữ nguyên định dạng.</p>
+        {savedCount > 0 && <div style={L.savedPill}>✓ Đã lưu {savedCount} gói form trong máy — sẵn sàng dùng tiếp</div>}
         <div style={L.btnRow}>
           <button style={L.btnWhite} onClick={onEnter}>Vào ứng dụng →</button>
           <button style={L.btnGlass} onClick={() => fileRef.current?.click()}>{logo ? "Đổi logo" : "Tải logo"}</button>
@@ -256,7 +337,7 @@ function Landing({ logo, setLogo, onEnter }) {
         <div style={L.cardRow}>
           <FeatureCard icon="⤓" title="Upload form theo gói" desc="Mỗi gói một mẫu riêng" />
           <FeatureCard icon="◧" title="Tự dò trường đỏ" desc="Đỏ &amp; {{placeholder}}" />
-          <FeatureCard icon="⎙" title="Xuất Word" desc="Giữ nguyên định dạng gốc" />
+          <FeatureCard icon="⎙" title="Lưu &amp; dùng lại" desc="Reload vẫn còn dữ liệu" />
         </div>
       </div>
     </div>
@@ -275,9 +356,8 @@ function FeatureCard({ icon, title, desc }) {
 // ============================================================
 //  APP SHELL
 // ============================================================
-function AppShell({ logo, setLogo, onHome, jszipReady, docxReady, xlsxReady, templates, setTemplates, activeTpl, setActiveTpl }) {
+function AppShell({ logo, setLogo, onHome, jszipReady, docxReady, xlsxReady, templates, setTemplates, activeTpl, setActiveTpl, records, setRecords }) {
   const [tab, setTab] = useState("ho-so");
-  const [records, setRecords] = useState({}); // { [tplId]: [hoSo,...] }
   const [expanded, setExpanded] = useState(null);
   const [exportTarget, setExportTarget] = useState(null);
   const [query, setQuery] = useState("");
@@ -354,6 +434,16 @@ function AppShell({ logo, setLogo, onHome, jszipReady, docxReady, xlsxReady, tem
       return { ...r, [active.id]: [...r[active.id], copy] };
     });
 
+  const removeTpl = (id) => {
+    const t = templates.find((x) => x.id === id);
+    const n = (records[id] || []).length;
+    if (!confirm(`Xóa gói "${t?.name}" khỏi thư viện?${n ? ` Kèm ${n} hồ sơ trong gói này sẽ mất.` : ""}`)) return;
+    const rest = templates.filter((x) => x.id !== id);
+    setTemplates(rest);
+    setRecords((r) => { const c = { ...r }; delete c[id]; return c; });
+    if (activeTpl === id) { setActiveTpl(rest[0]?.id || null); setExpanded(null); }
+  };
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return recs;
@@ -387,14 +477,16 @@ function AppShell({ logo, setLogo, onHome, jszipReady, docxReady, xlsxReady, tem
         <span style={A.tplLabel}>GÓI:</span>
         {tplList.length === 0 && <span style={A.tplEmpty}>Chưa có form nào — bấm “Upload form gói” để thêm.</span>}
         {tplList.map((t) => (
-          <button
-            key={t.id}
-            style={t.id === activeTpl ? A.tplChipActive : A.tplChip}
-            onClick={() => { setActiveTpl(t.id); setExpanded(null); if (!records[t.id]) setRecords((r) => ({ ...r, [t.id]: [makeRecord(t)] })); }}
-            title={`${t.fields.length} trường biến đổi`}
-          >
-            {t.name} <span style={A.tplCount}>{t.fields.length}</span>
-          </button>
+          <span key={t.id} style={t.id === activeTpl ? A.tplChipWrapActive : A.tplChipWrap}>
+            <button
+              style={t.id === activeTpl ? A.tplChipActive : A.tplChip}
+              onClick={() => { setActiveTpl(t.id); setExpanded(null); if (!records[t.id]) setRecords((r) => ({ ...r, [t.id]: [makeRecord(t)] })); }}
+              title={`${t.fields.length} trường biến đổi · ${(records[t.id] || []).length} hồ sơ`}
+            >
+              {t.name} <span style={A.tplCount}>{t.fields.length}</span>
+            </button>
+            <button style={A.tplDel} title="Xóa gói này khỏi thư viện" onClick={() => removeTpl(t.id)}>✕</button>
+          </span>
         ))}
       </div>
 
@@ -1009,6 +1101,7 @@ const L = {
   h1: { fontSize: 50, fontWeight: 800, margin: "6px 0 14px", letterSpacing: "-.02em" },
   sub: { fontSize: 17, lineHeight: 1.6, color: "rgba(255,255,255,.88)", maxWidth: 580, margin: "0 auto 30px" },
   btnRow: { display: "flex", gap: 14, justifyContent: "center", flexWrap: "wrap", marginBottom: 46 },
+  savedPill: { display: "inline-block", background: "rgba(255,255,255,.16)", border: "1px solid rgba(255,255,255,.35)", color: "#fff", fontSize: 13, fontWeight: 600, padding: "7px 16px", borderRadius: 20, marginBottom: 22 },
   btnWhite: { background: "#fff", color: BLUE_DK, border: "none", borderRadius: 12, padding: "15px 30px", fontSize: 16, fontWeight: 800, cursor: "pointer", fontFamily: "inherit", boxShadow: "0 8px 24px rgba(0,0,0,.18)" },
   btnGlass: { background: "rgba(255,255,255,.16)", color: "#fff", border: "1.5px solid rgba(255,255,255,.4)", borderRadius: 12, padding: "15px 26px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" },
   cardRow: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, maxWidth: 660, margin: "0 auto" },
@@ -1036,8 +1129,11 @@ const A = {
   tplBar: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "10px 22px", background: "#eaf4f8", borderBottom: `1px solid ${LINE}` },
   tplLabel: { fontSize: 11, fontWeight: 800, letterSpacing: ".08em", color: "#5d7589" },
   tplEmpty: { fontSize: 13, color: "#7790a3" },
-  tplChip: { background: "#fff", color: "#42627a", border: `1px solid ${LINE}`, borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
-  tplChipActive: { background: BLUE, color: "#fff", border: `1px solid ${BLUE}`, borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 800, cursor: "pointer", fontFamily: "inherit" },
+  tplChipWrap: { display: "inline-flex", alignItems: "center", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 20, overflow: "hidden" },
+  tplChipWrapActive: { display: "inline-flex", alignItems: "center", background: BLUE, border: `1px solid ${BLUE}`, borderRadius: 20, overflow: "hidden" },
+  tplChip: { background: "transparent", color: "#42627a", border: "none", padding: "6px 8px 6px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  tplChipActive: { background: "transparent", color: "#fff", border: "none", padding: "6px 8px 6px 14px", fontSize: 13, fontWeight: 800, cursor: "pointer", fontFamily: "inherit" },
+  tplDel: { background: "transparent", border: "none", color: "inherit", opacity: 0.6, cursor: "pointer", fontSize: 12, padding: "6px 10px 6px 4px", fontFamily: "inherit" },
   tplCount: { display: "inline-block", marginLeft: 6, background: "rgba(0,0,0,.12)", borderRadius: 10, padding: "0 7px", fontSize: 11 },
 
   tabs: { display: "flex", gap: 4, background: "#fff", padding: "0 22px", borderBottom: `1px solid ${LINE}` },
